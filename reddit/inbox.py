@@ -24,6 +24,7 @@ class Inbox(RedditContentObject):
     def __init__(self, reddit_session, json_dict=None, fetch=True):
       self.URL = urls["inbox"]
       self.messages = None
+      self.newmessages = None
       super(Inbox, self).__init__(reddit_session, "Inbox", json_dict, fetch)
 
     def get_messages(self, force = False, *args, **kwargs):
@@ -32,9 +33,11 @@ class Inbox(RedditContentObject):
         self.messages = self._request_json(self.URL)["data"]["children"]
       return self.messages
 
-    def get_new_messages(self):
-      self.get_messages(force = True)
-      return [msg for msg in self.messages if hasattr(msg, "new") and msg.new]
+    def get_new_messages(self, force = False, *args, **kwargs):
+      # Crude caching
+      if self.newmessages == None or force:
+        self.newmessages = self._request_json(urls["unread"])["data"]["children"]
+      return self.newmessages
       
     def __str__(self):
       if self.messages == None:
