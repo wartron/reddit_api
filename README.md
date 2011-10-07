@@ -1,3 +1,9 @@
+Fixes
+------------
+I needed to count unread messages and the current code base was not working for me. 
+(Changes where simple, now using the messages/unread/ url endpoint)
+
+
 Introduction
 ------------
 
