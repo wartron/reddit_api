@@ -1,5 +1,5 @@
 # This file is part of reddit_api.
-# 
+#
 # reddit_api is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
@@ -9,140 +9,127 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with reddit_api.  If not, see <http://www.gnu.org/licenses/>.
 
-from settings import WAIT_BETWEEN_CALL_TIME
-from urls import urls
+import time
+import warnings
 from functools import wraps
 from urlparse import urljoin
-from api_exceptions import BadCaptcha, InvalidUserPass, NotLoggedInException
-import time
 
-class require_captcha(object):
-    """
-    Decorator for methods that require captchas.
-    """
-    URL = urls["new_captcha"]
-    VIEW_URL = urls["view_captcha"]
+from reddit import errors
+
+
+class RequireCaptcha(object):
+    """Decorator for methods that require captchas."""
 
     def __init__(self, func):
         wraps(func)(self)
         self.func = func
-        self.captcha_id = None
-        self.captcha = None
 
-    def __get__(self, obj, type=None):
+    def __get__(self, obj, key):
         if obj is None:
             return self
-        return self.__class__(self.func.__get__(obj, type))
+        return self.__class__(self.func.__get__(obj, key))
 
-    def __call__(self, caller, *args, **kwargs):
-        do_captcha = False
+    def __call__(self, *args, **kwargs):
+        captcha_id = None
         while True:
             try:
-                if do_captcha:
-                    self.get_captcha(caller)
-                    kwargs['captcha'] = self.captcha_as_dict
-                return self.func(caller, *args, **kwargs)
-            except BadCaptcha:
-                do_captcha = True
+                if captcha_id:
+                    kwargs['captcha'] = self.get_captcha(captcha_id)
+                return self.func(*args, **kwargs)
+            except errors.BadCaptcha, exception:
+                captcha_id = exception.response['captcha']
 
-    @property
-    def captcha_as_dict(self):
-        return {"iden" : self.captcha_id, "captcha" : self.captcha}
-
-    @property
-    def captcha_url(self):
-        if self.captcha_id:
-            return urljoin(self.VIEW_URL, self.captcha_id + ".png")
-
-    def get_captcha(self, caller):
-        data = caller._request_json(self.URL, {"renderstyle" : "html"})
-        # TODO: fix this, it kills kittens
-        self.captcha_id = data["jquery"][-1][-1][-1]
-        print "Captcha URL: " + self.captcha_url
-        self.captcha = raw_input("Captcha: ")
+    def get_captcha(self, captcha_id):
+        url = urljoin(self.func.im_self.config['captcha'], captcha_id + '.png')
+        print 'Captcha URL: ' + url
+        captcha = raw_input('Captcha: ')
+        return {'iden': captcha_id, 'captcha': captcha}
 
 
 def require_login(func):
     """A decorator to ensure that a user has logged in before calling the
     function."""
+
     @wraps(func)
     def login_reqd_func(self, *args, **kwargs):
-        try:
-            user = self.user
-        except AttributeError:
+        if isinstance(self, RedditContentObject):
             user = self.reddit_session.user
+            modhash = self.reddit_session.modhash
+        else:
+            user = self.user
+            modhash = self.modhash
 
-        if user is None:
-            raise NotLoggedInException()
+        if user is None or modhash is None:
+            raise errors.LoginRequired('`%s` requires login.' % func.__name__)
         else:
             return func(self, *args, **kwargs)
     return login_reqd_func
 
-class sleep_after(object):
+
+class SleepAfter(object):  # pylint: disable-msg=R0903
     """
     A decorator to add to API functions that shouldn't be called too
     rapidly, in order to be nice to the reddit server.
 
-    Every function wrapped with this decorator will use a collective
-    last_call_time attribute, so that collectively any one of the funcs won't
-    be callable within the WAIT_BETWEEN_CALL_TIME; they'll automatically be
+    Every function wrapped with this decorator will use a domain specific
+    last_call attribute, so that collectively any one of the funcs won't be
+    callable within the site's api_request_delay time; they'll automatically be
     delayed until the proper duration is reached.
     """
-    last_call_time = 0     # init to 0 to always allow the 1st call
-    WAIT_BETWEEN_CALL_TIME = WAIT_BETWEEN_CALL_TIME
 
     def __init__(self, func):
         wraps(func)(self)
         self.func = func
+        self.last_call = {}
 
     def __call__(self, *args, **kwargs):
-        call_time = time.time()
-
-        since_last_call = call_time - self.last_call_time
-        if since_last_call < WAIT_BETWEEN_CALL_TIME:
-            time.sleep(WAIT_BETWEEN_CALL_TIME - since_last_call)
-
-        self.__class__.last_call_time = call_time
+        config = args[0].config
+        if config.domain in self.last_call:
+            last_call = self.last_call[config.domain]
+        else:
+            last_call = 0
+        now = time.time()
+        delay = last_call + int(config.api_request_delay) - now
+        if delay > 0:
+            now += delay
+            time.sleep(delay)
+        self.last_call[config.domain] = now
         return self.func(*args, **kwargs)
 
-def parse_api_json_response(func):
+
+def parse_api_json_response(func):  # pylint: disable-msg=R0912
     """Decorator to look at the Reddit API response to an API POST request like
     vote, subscribe, login, etc. Basically, it just looks for certain errors in
     the return string. If it doesn't find one, then it just returns True.
     """
     @wraps(func)
-    def error_checked_func(*args, **kwargs):
-        return_value = func(*args, **kwargs)
-        if not return_value:
-            return
-        else:
-            # todo, clean up this code. for right now, i just surrounded it
-            # with a try, except. basically the issue is when the _json_request
-            # wants to return a list, for example when you request the page for
-            # a story; the reddit api returns json for the story and the
-            # comments.
-            try:
-                jquery = None
-                for k in return_value.keys():
-                    if k not in (u"jquery", "iden", "captcha", "kind", "data"):
-                        warnings.warn("Return value keys contained "
-                                "{0}!".format(return_value.keys()))
-                        jquery = return_value.get("jquery")
-                if jquery:
-                    values = [x[-1] for x in jquery]
-                    if [".error.USER_REQUIRED"] in values:
-                        raise NotLoggedInException()
-                    elif [".error.WRONG_PASSWORD.field-passwd"] in values:
-                        raise InvalidUserPass()
-                    elif [".error.RATELIMIT.field-vdelay"] in values:
-                        raise Exception('Rate limit exceeded')
-                    elif [".error.BAD_CAPTCHA.field-captcha"] in values:
-                        raise BadCaptcha()
-            except AttributeError:
-                pass
-            return return_value
+    def error_checked_func(self, *args, **kwargs):
+        return_value = func(self, *args, **kwargs)
+        if isinstance(return_value, dict):
+            for k in return_value:
+                allowed = ('captcha', 'data', 'errors', 'kind', 'names',
+                           'next', 'prev', 'users')
+                if k not in allowed:
+                    warnings.warn('Unknown return value key: %s' % k)
+            if 'errors' in return_value and return_value['errors']:
+                error_list = []
+                for error_type, msg, value in return_value['errors']:
+                    if error_type in errors.ERROR_MAPPING:
+                        error_class = errors.ERROR_MAPPING[error_type]
+                    else:
+                        error_class = errors.APIException
+                    error_list.append(error_class(error_type, msg, value,
+                                                  return_value))
+                if len(error_list) == 1:
+                    raise error_list[0]
+                else:
+                    raise errors.ExceptionList(error_list)
+        return return_value
     return error_checked_func
+
+# Avoid circular import: http://effbot.org/zone/import-confusion.htm
+from reddit.objects import RedditContentObject
